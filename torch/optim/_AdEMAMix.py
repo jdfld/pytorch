@@ -1,22 +1,20 @@
 # Starting from the torch Adam implementation
 # an implementation of AdEMAMix attempting to stick as closely as possible to the Adam implementation.
 # AdEMAMix adds the additional Exponential Moving Average retain more information during long context learning.
-# Originally presented in the paper: https://arxiv.org/pdf/2409.03137, as a part of the Apertus technical report.
+# Originally presented in the paper: https://arxiv.org/pdf/2409.03137,
+# Benchmarked for good performance with this paper: 
+# And used during training of Apertus.
 
-
-# TODO test in all different use cases in a clean notebook. 
-# it will be a bit annoying maintaining this even though a lot of stuff is shared
-# unfortunately the changes are made at a fairly fundemental level, 
-# which means it might be difficult. 
 
 # TODO implement fused version, by adapting code from:
 # pytorch/aten/src/ATen/native/cuda/FusedAdamWKernel.cu
 
-
+# TODO look more at the scheduling side, additionally Initialization of the EMA
+# is also something which could be relevant to look at.
 
 # mypy: allow-untyped-defs
 from typing import cast, Optional, Union
-
+from collections.abs import Callable
 
 import torch
 from torch import Tensor
@@ -45,16 +43,45 @@ from .optimizer import (
 __all__ = ["AdEMAMix", "ademamix"]
 
 
+# Schedulers implemented from the jax based version of AdEMAMix, adapted for torch
+def _alpha_scheduler(alpha_end, alpha_start, warmup=1):
+    def schedule(step):
+        is_warmup = (step < warmup).astype(torch.float32)
+        a = step / float(warmup)
+        return is_warmup * ((1.0-a) * alpha_start + a * alpha) + alpha * (1.0-is_warmup)
+    return schedule
+
+def _beta3_scheduler(beta_end, beta_start, warmup=1): 
+    def f(beta):
+        return torch.log(0.5)/torch.log(beta)-1
+
+    def f_inv(t):
+        return torch.pow(0.5,1/(t+1))
+    
+    def schedule(step):
+        is_warmup = (step < warmup).astype(torch.float32)
+        a = step / float(warmup)
+        return is_warmup * f_inv((1.0-a) * f(beta_start) + a * f(beta_end)) + beta_end * (1.0-is_warmup)
+    return schedule
+
+
+
+
 class AdEMAMix(Optimizer):
     def __init__(
         self,
         params: ParamsT,
         lr: Union[float, Tensor] = 1e-3,
         betas: tuple[Union[float, Tensor], Union[float, Tensor],Union[float, Tensor]] = (0.9, 0.999,0.9999), # beta3 chosen from paper
-        alpha: Union[float,Tensor] = 5, #TODO Verify that this is an okay value. Set between 4-10, described in paper. 
+        alpha_init: Union[float]
+        alpha: Union[float,Tensor] = 5, #TODO Verify that this is an okay value. The paper describes that the value should be set between 4-10 however the github implementation uses 2.
         eps: float = 1e-8,
         weight_decay: float = 0,
         amsgrad: bool = False,
+        beta3_warmup_steps: int = None,
+        beta3_start: Union[float,Tensor] = None,
+        alpha_warmup_steps: int = None,
+        alpha_start: Union[float,Tensor] = None, 
         *,
         foreach: Optional[bool] = None,
         maximize: bool = False,
@@ -81,11 +108,21 @@ class AdEMAMix(Optimizer):
             raise ValueError(f"Invalid beta parameter at index 2: {betas[2]}")
         if not 0.0 <= weight_decay:
             raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+        if not 0.0 <= beta3_start < 1.0:
+            raise ValueError(f"Invalid start value of beta3: {beta3_start}")
+        if not 1 < beta3_warmup_steps:
+            raise ValueError(f"Invalid number of warmup steps for beta3: {beta3_warmup_steps}")
+        if not 1 < alpha_warmup_steps:
+            raise ValueError(f"Invalid number of warmup steps for alpha: {alpha_warmup_steps}")
         if not (
             (isinstance(betas[0], float) and isinstance(betas[1], float) and isinstance(betas[2], float))
             or (isinstance(betas[0], Tensor) and isinstance(betas[1], Tensor) and isinstance(betas[2], Tensor))
         ):
             raise ValueError("all three betas need to be floats or Tensors")
+        if ((beta3_warmup_steps is None) != (beta3_start is None)):
+            raise ValueError("Both the betas_warmup_steps and beta_start need to be initialized for scheduler")
+        if ((beta3_warmup_steps is None) != (beta3_start is None)):
+            raise ValueError("Both the alpha_warmup_steps and alpha_start need to be initialized for schedule")
         if isinstance(betas[0], Tensor):
             if not capturable and foreach:
                 raise ValueError(
@@ -121,6 +158,8 @@ class AdEMAMix(Optimizer):
             differentiable=differentiable,
             decoupled_weight_decay=decoupled_weight_decay,
         )
+        self.beta3_scheduler = None if beta3_start is None else _beta3_scheduler(beta3, beta3_start, beta3_warmup_steps)
+        self.alpha_scheduler = None if alpha_start is None else _alpha_scheduler(alpha, alpha_start, alpha_warmup_steps)
         super().__init__(params, defaults)
 
     def __setstate__(self, state):
@@ -151,8 +190,8 @@ class AdEMAMix(Optimizer):
         group,
         params_with_grad,
         grads,
-        exp_fast_avgs,
-        exp_slow_avgs,
+        exp_avgs_fast,
+        exp_avgs_slow,
         exp_avg_sqs,
         max_exp_avg_sqs,
         state_steps,
@@ -184,11 +223,11 @@ class AdEMAMix(Optimizer):
                         else torch.tensor(0.0, dtype=_get_scalar_dtype())
                     )
                     # Exponential moving average of gradient values
-                    state["exp_fast_avg"] = torch.zeros_like(
+                    state["exp_avg_fast"] = torch.zeros_like(
                         p, memory_format=torch.preserve_format
                     )
                     # Additional exponential moving average with slower updates introduced by AdEMAMix
-                    state["exp_slow_avg"] = torch.zeros_like(
+                    state["exp_avg_slow"] = torch.zeros_like(
                         p, memory_format=torch.preserve_format
                     )
                     # Exponential moving average of squared gradient values
@@ -201,8 +240,8 @@ class AdEMAMix(Optimizer):
                             p, memory_format=torch.preserve_format
                         )
 
-                exp_fast_avgs.append(state["exp_fast_avg"])
-                exp_slow_avgs.append(state["exp_slow_avg"])
+                exp_avgs_fast.append(state["exp_avg_fast"])
+                exp_avgs_slow.append(state["exp_avg_slow"])
                 exp_avg_sqs.append(state["exp_avg_sq"])
 
                 if group["amsgrad"]:
@@ -239,23 +278,26 @@ class AdEMAMix(Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
-
         for group in self.param_groups:
             params_with_grad: list[Tensor] = []
             grads: list[Tensor] = []
-            exp_fast_avgs: list[Tensor] = []
-            exp_slow_avgs: list[Tensor] = []
+            exp_avgs_fast: list[Tensor] = []
+            exp_avgs_slow: list[Tensor] = []
             exp_avg_sqs: list[Tensor] = []
             max_exp_avg_sqs: list[Tensor] = []
             state_steps: list[Tensor] = []
             beta1, beta2, beta3 = group["betas"]
-
+            alpha = group['alpha']
+            if self.beta3_scheduler:
+                beta3 = self.beta3_scheduler(state_steps)
+            if self.alpha_scheduler
+                alpha = self.alpha_scheduler(state_steps)
             has_complex = self._init_group(
                 group,
                 params_with_grad,
                 grads,
-                exp_fast_avgs,
-                exp_slow_avgs,
+                exp_avgs_fast,
+                exp_avgs_slow,
                 exp_avg_sqs,
                 max_exp_avg_sqs,
                 state_steps,
@@ -264,8 +306,8 @@ class AdEMAMix(Optimizer):
             ademamix(
                 params_with_grad,
                 grads,
-                exp_fast_avgs,
-                exp_slow_avgs,
+                exp_avgs_fast,
+                exp_avgs_slow,
                 exp_avg_sqs,
                 max_exp_avg_sqs,
                 state_steps,
@@ -274,7 +316,7 @@ class AdEMAMix(Optimizer):
                 beta1=beta1,
                 beta2=beta2,
                 beta3=beta3,
-                alpha=group['alpha'],
+                alpha=alpha,
                 lr=group["lr"],
                 weight_decay=group["weight_decay"],
                 eps=group["eps"],
@@ -289,7 +331,6 @@ class AdEMAMix(Optimizer):
 
         return loss
 
-# TODO fix this part.
 AdEMAMix.__doc__ = (
     r"""Implements AdEMAMix algorithm.
 
@@ -335,16 +376,23 @@ AdEMAMix.__doc__ = (
             is not yet supported for all our implementations. Please use a float
             LR if you are not also specifying capturable=True.
         betas (Tuple[float, float, float], optional): coefficients used for computing
-           the fast running averages of gradient, its square and the slow running average introduced by AdEMAMix,
+           the fast running averages of gradient, its square and the slow running average introduced by AdEMAMix
            (default: (0.9, 0.999,0.9999))
         alpha (float, Tensor, optional): coefficient used as a replacement for the bias 
-        correction parameter used for the slow running average in AdEMAMix
+        correction parameter used for the slow running average in AdEMAMix. 
+        according to the AdEMAMix paper should range from (4,10) (default: 5)
         eps (float, optional): term added to the denominator to improve
             numerical stability (default: 1e-8)
         weight_decay (float, optional): weight decay (L2 penalty) (default: 0)
-        decoupled_weight_decay (bool, optional): if True, this optimizer is
-            equivalent to AdamW and the algorithm will not accumulate weight
-            decay in the momentum nor variance. (default: False)
+        decoupled_weight_decay (bool, optional): if True, the optimizer functions as described in the original paper
+        by handling the weight decay as done in AdamW and the algorithm will not accumulate weight
+            decay in the momentum nor variance. (default: True)
+        beta3_start (float, Tensor, optional): If set to a value it represents the initial value,
+        for the linear scheduling of the beta3 parameter, it will linearly increase to approach beta3.  (default: None)
+        beta3_warmup_steps (int,optional): number of steps before moving to the final beta3 value. (default: None)
+        alpha_start (float, Tensor, optional): If set to a value it represents the initial value,
+        for the linear scheduling of the alpha parameter, it will linearly increase to approach alpha.  (default: None)
+        alpha_warmup_steps (int,optional): number of steps before moving to the final alpha value. (default: None)
         amsgrad (bool, optional): whether to use the AMSGrad variant of this
             algorithm from the paper `On the Convergence of Adam and Beyond`_
             (default: False)
@@ -359,8 +407,8 @@ AdEMAMix.__doc__ = (
 def _single_tensor_ademamix(
     params: list[Tensor],
     grads: list[Tensor],
-    exp_fast_avgs: list[Tensor],
-    exp_slow_avgs: list[Tensor],
+    exp_avgs_fast: list[Tensor],
+    exp_avgs_slow: list[Tensor],
     exp_avg_sqs: list[Tensor],
     max_exp_avg_sqs: list[Tensor],
     state_steps: list[Tensor],
@@ -411,8 +459,8 @@ def _single_tensor_ademamix(
 
     for i, param in enumerate(params):
         grad = grads[i] if not maximize else -grads[i]
-        exp_fast_avg = exp_fast_avgs[i]
-        exp_slow_avg = exp_slow_avgs[i]
+        exp_avg_fast = exp_avgs_fast[i]
+        exp_avg_slow = exp_avgs_slow[i]
         exp_avg_sq = exp_avg_sqs[i]
         step_t = state_steps[i]
 
@@ -445,8 +493,8 @@ def _single_tensor_ademamix(
 
         if torch.is_complex(param):
             grad = torch.view_as_real(grad)
-            exp_fast_avg = torch.view_as_real(exp_fast_avg)
-            exp_slow_avg = torch.view_as_real(exp_slow_avg)
+            exp_avg_fast = torch.view_as_real(exp_avg_fast)
+            exp_avg_slow = torch.view_as_real(exp_avg_slow)
             exp_avg_sq = torch.view_as_real(exp_avg_sq)
             if amsgrad:
                 max_exp_avg_sqs[i] = torch.view_as_real(max_exp_avg_sqs[i])
@@ -483,8 +531,8 @@ def _single_tensor_ademamix(
             device_beta3 = beta3
 
         # Decay the first and second moment running average coefficients
-        exp_fast_avg.lerp_(grad, 1 - device_beta1)
-        exp_slow_avg.lerp_(grad, 1 - device_beta3)
+        exp_avg_fast.lerp_(grad, 1 - device_beta1)
+        exp_avg_slow.lerp_(grad, 1 - device_beta3)
 
         # Nested if is necessary to bypass jitscript rules
         # CHANGE from origin, where beta2.requires_grad was split of from the other checks?
@@ -530,8 +578,8 @@ def _single_tensor_ademamix(
             # Computes numerator for update step
             # As the slow moving average should not be modified by the bias correction, 
             # we cannot fold in the operation with the lr
-            numer = torch.div(exp_fast_avg, bias_correction1)
-            numer.addcmul_(alpha,exp_slow_avg)
+            numer = torch.div(exp_avg_fast, bias_correction1)
+            numer.addcmul_(alpha,exp_avg_slow)
 
             
             # Computes denominator for update step
@@ -562,7 +610,7 @@ def _single_tensor_ademamix(
 
             bias_correction1 = 1 - beta1**step
             bias_correction2 = 1 - beta2**step
-            # No bias correction for exp_slow_avg
+            # No bias correction for exp_avg_slow
 
             step_size = lr / bias_correction1
 
@@ -577,7 +625,7 @@ def _single_tensor_ademamix(
             else:
                 denom = (exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)
 
-            numer = torch.add(exp_fast_avg,exp_slow_avg,alpha=alpha*bias_correction1)
+            numer = torch.add(exp_avg_fast,exp_avg_slow,alpha=alpha*bias_correction1)
             param.addcdiv_(numer, denom, value=-step_size)
 
         # Lastly, switch back to complex view
@@ -588,8 +636,8 @@ def _single_tensor_ademamix(
 def _multi_tensor_ademamix(
     params: list[Tensor],
     grads: list[Tensor],
-    exp_fast_avgs: list[Tensor],
-    exp_slow_avgs: list[Tensor],
+    exp_avgs_fast: list[Tensor],
+    exp_avgs_slow: list[Tensor],
     exp_avg_sqs: list[Tensor],
     max_exp_avg_sqs: list[Tensor],
     state_steps: list[Tensor],
@@ -668,7 +716,7 @@ def _multi_tensor_ademamix(
     # TODO: Support Tensor alphas
 
     grouped_tensors = Optimizer._group_tensors_by_device_and_dtype(
-        [params, grads, exp_fast_avgs, exp_slow_avgs, exp_avg_sqs, max_exp_avg_sqs, state_steps]  # type: ignore[list-item]
+        [params, grads, exp_avgs_fast, exp_avgs_slow, exp_avg_sqs, max_exp_avg_sqs, state_steps]  # type: ignore[list-item]
     )
 
     # We only shuffle around the beta when it is a Tensor and on CUDA, otherwise, we prefer
@@ -687,16 +735,16 @@ def _multi_tensor_ademamix(
     for (
         device_params_,
         device_grads_,
-        device_exp_fast_avgs_,
-        device_exp_slow_avgs_,
+        device_exp_avgs_fast_,
+        device_exp_avgs_slow_,
         device_exp_avg_sqs_,
         device_max_exp_avg_sqs_,
         device_state_steps_,
     ), _ in grouped_tensors.values():
         device_params = cast(list[Tensor], device_params_)
         device_grads = cast(list[Tensor], device_grads_)
-        device_exp_fast_avgs = cast(list[Tensor], device_exp_fast_avgs_)
-        device_exp_slow_avgs = cast(list[Tensor], device_exp_slow_avgs_)
+        device_exp_avgs_fast = cast(list[Tensor], device_exp_avgs_fast_)
+        device_exp_avgs_slow = cast(list[Tensor], device_exp_avgs_slow_)
         device_exp_avg_sqs = cast(list[Tensor], device_exp_avg_sqs_)
         device_state_steps = cast(list[Tensor], device_state_steps_)
 
@@ -716,14 +764,14 @@ def _multi_tensor_ademamix(
                 _view_as_real(
                     device_params,
                     device_grads,
-                    device_exp_fast_avgs,
-                    device_exp_slow_avgs,
+                    device_exp_avgs_fast,
+                    device_exp_avgs_slow,
                     device_exp_avg_sqs,
                     device_max_exp_avg_sqs,
                 )
             else:
                 _view_as_real(
-                    device_params, device_grads, device_exp_fast_avgs, device_exp_slow_avgs, device_exp_avg_sqs
+                    device_params, device_grads, device_exp_avgs_fast, device_exp_avgs_slow, device_exp_avg_sqs
                 )
 
         if maximize:
@@ -756,9 +804,9 @@ def _multi_tensor_ademamix(
         # Decay the first and second moment running average coefficient
         # Use device beta1 if beta1 is a tensor to ensure all
         # tensors are on the same device
-        torch._foreach_lerp_(device_exp_fast_avgs, device_grads, 1 - device_beta1)
+        torch._foreach_lerp_(device_exp_avgs_fast, device_grads, 1 - device_beta1)
         
-        torch._foreach_lerp_(device_exp_slow_avgs, device_grads, 1 - device_beta3)
+        torch._foreach_lerp_(device_exp_avgs_slow, device_grads, 1 - device_beta3)
 
         torch._foreach_mul_(device_exp_avg_sqs, beta2)
 
@@ -824,13 +872,13 @@ def _multi_tensor_ademamix(
 
             # param + (M_2 * alpha + bias_correction1 * M_1) * lr / V_1
             numer = torch._foreach_addcmul(
-                device_exp_slow_avgs,
-                device_exp_fast_avgs,
+                device_exp_avgs_slow,
+                device_exp_avgs_fast,
                 bias_correction1,
                 value=-1/alpha # inverted here to skip a neg operation
                 )
             # at this point, exp_avg_sq_sqrt =  [sqrt(exp_avg_sq / (1 - beta2^t)) + eps]
-            # and: numer = exp_slow_avgs + exp_fast_avgs / (alpha*(1-beta1^t))
+            # and: numer = exp_avgs_slow + exp_avgs_fast / (alpha*(1-beta1^t))
             torch._foreach_addcdiv_(device_params, numer, exp_avg_sq_sqrt,value=-lr*alpha)
         else:
             bias_correction1 = [
@@ -859,8 +907,8 @@ def _multi_tensor_ademamix(
             torch._foreach_div_(exp_avg_sq_sqrt, bias_correction2_sqrt)
             torch._foreach_add_(exp_avg_sq_sqrt, eps)
             numer = torch._foreach_addcdiv(
-                device_exp_slow_avgs,
-                device_exp_fast_avgs,
+                device_exp_avgs_slow,
+                device_exp_avgs_fast,
                 bias_correction1,
                 value=1/alpha)
             torch._foreach_addcdiv_(
@@ -875,8 +923,8 @@ def _multi_tensor_ademamix(
 def ademamix(
     params: list[Tensor],
     grads: list[Tensor],
-    exp_fast_avgs: list[Tensor],
-    exp_slow_avgs: list[Tensor],
+    exp_avgs_fast: list[Tensor],
+    exp_avgs_slow: list[Tensor],
     exp_avg_sqs: list[Tensor],
     max_exp_avg_sqs: list[Tensor],
     state_steps: list[Tensor],
@@ -935,8 +983,8 @@ def ademamix(
     func(
         params,
         grads,
-        exp_fast_avgs,
-        exp_slow_avgs,
+        exp_avgs_fast,
+        exp_avgs_slow,
         exp_avg_sqs,
         max_exp_avg_sqs,
         state_steps,
