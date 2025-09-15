@@ -156,7 +156,7 @@ class AdEMAMix(Optimizer):
             differentiable=differentiable,
             decoupled_weight_decay=decoupled_weight_decay,
         )
-        self.beta3_scheduler = None if beta3_start is None else _beta3_scheduler(beta3, beta3_start, beta3_warmup_steps)
+        self.beta3_scheduler = None if beta3_start is None else _beta3_scheduler(betas[2], beta3_start, beta3_warmup_steps)
         self.alpha_scheduler = None if alpha_start is None else _alpha_scheduler(alpha, alpha_start, alpha_warmup_steps)
         super().__init__(params, defaults)
 
@@ -888,8 +888,8 @@ def _multi_tensor_ademamix(
             bias_correction2 = [
                 1 - beta2 ** _get_value(step) for step in device_state_steps
             ]
-            # CHANGE, REMOVED
-            #step_size = _stack_if_compiling([(lr / bc) * -1 for bc in bias_correction1])
+
+            #stacked_bc = _stack_if_compiling([-1*(lr/bc) for bc in bias_correction1])
 
             bias_correction2_sqrt = [bc**0.5 for bc in bias_correction2]  # type: ignore[arg-type]
 
@@ -907,16 +907,16 @@ def _multi_tensor_ademamix(
 
             torch._foreach_div_(exp_avg_sq_sqrt, bias_correction2_sqrt)
             torch._foreach_add_(exp_avg_sq_sqrt, eps)
-            numer = torch._foreach_addcdiv(
-                device_exp_avgs_slow,
-                device_exp_avgs_fast,
-                bias_correction1,
-                value=1/alpha)
+            # Difficult to fuse as _foreach_add cannot have an alpha as a list.
+            # We can fold a operation like bias_correction into addcdiv. 
+            # However as we do not want to modify device_exp_avgs_slow with bias_correction this is not possible. 
+            numer = torch._foreach_div(device_exp_avgs_fast, bias_correction1)
+            torch._foreach_add_(numer,device_exp_avgs_slow,alpha=alpha)
             torch._foreach_addcdiv_(
                 device_params,
                 numer,
                 exp_avg_sq_sqrt,
-                value=-lr*alpha,
+                value=-lr,
             )
 
 
