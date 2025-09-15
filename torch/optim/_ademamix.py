@@ -116,7 +116,7 @@ class AdEMAMix(Optimizer):
             (isinstance(betas[0], float) and isinstance(betas[1], float) and isinstance(betas[2], float))
             or (isinstance(betas[0], Tensor) and isinstance(betas[1], Tensor) and isinstance(betas[2], Tensor))
         ):
-            raise ValueError("all three betas need to be floats or Tensors")
+            raise ValueError("All three betas need to be floats or Tensors")
         if ((beta3_warmup_steps is None) != (beta3_start is None)):
             raise ValueError("Both the betas_warmup_steps and beta_start need to be initialized for scheduler")
         if ((beta3_warmup_steps is None) != (beta3_start is None)):

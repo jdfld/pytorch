@@ -771,16 +771,10 @@ def optim_inputs_func_ademamix(device, dtype=None):
         OptimizerInput(
             params=None, kwargs={"weight_decay": 0.1}, desc="nonzero weight_decay"
         ),
-        OptimizerInput(params=None, kwargs={"maximize": True}, desc="maximize"),
         OptimizerInput(
             params=None,
             kwargs={"weight_decay": 0.1, "maximize": True},
             desc="maximize, weight_decay",
-        ),
-        OptimizerInput(
-            params=None,
-            kwargs={"betas": (0.5,0.75,0.99)},
-            desc="Non default betas",
         ),
         OptimizerInput(
             params=None,
@@ -789,25 +783,69 @@ def optim_inputs_func_ademamix(device, dtype=None):
         ),
         OptimizerInput(
             params=None,
+            kwargs={"beta3_start": 0.9, "beta3_warmup_steps":100},
+            desc="Beta scheduler",
+        ),
+        OptimizerInput(
+            params=None,
+            kwargs={"alpha_start": 2, "alpha_warmup_steps":50},
+            desc="Alpha scheduler",
+        ),
+        OptimizerInput(
+            params=None,
             kwargs={"lr": torch.tensor(0.001), "capturable": True},
             desc="Tensor lr with capturable",
         ),
         OptimizerInput(
             params=None,
-            kwargs={"alpha":4},
+            kwargs={"alpha":4, "capturable": True},
             desc="Alpha with capturable",
         ),
         OptimizerInput(
             params=None,
-            kwargs={"alpha":torch.tensor(4), "capturable": True},
-            desc="Alpha tensor with capturable",
+            kwargs={"alpha":torch.tensor(4), "diffrentiable": True},
+            desc="Alpha tensor with diffrentiable",
+        ),
+        OptimizerInput(
+            params=None,
+            kwargs={"weight_decay":0.1, "decoupled_weight_decay":False},
+            desc="Weight decayw ithout decoupled",
         ),
     ] + (cuda_supported_configs if _get_device_type(device) == "cuda" else [])
 
 def optim_error_inputs_func_ademamix(device, dtype):
-    
-
-    return 
+    error_inputs = get_error_inputs_for_all_optims(device, dtype)
+    if _get_device_type(device) == "cpu":
+        error_inputs += [
+            ErrorOptimizerInput(
+                OptimizerInput(
+                    params=None,
+                    kwargs=dict(lr=1e-2, weight_decay=-0.5),
+                    desc="weight_decay should > 0",
+                ),
+                error_type=ValueError,
+                error_regex="Invalid weight_decay value: -0.5",
+            ),
+            ErrorOptimizerInput(
+                OptimizerInput(
+                    params=None,
+                    kwargs=dict(lr=1e-2, betas=(0.99,0.999,torch.Tensor(0.9999))),
+                    desc="all three betas should either be tensors or floats",
+                ),
+                error_type=ValueError,
+                error_regex="All three betas need to be floats or Tensors",
+            ),
+            ErrorOptimizerInput(
+                OptimizerInput(
+                    params=None,
+                    kwargs=dict(alpha_start=1),
+                    desc="Alpha warmup steps needs to be initialized if alpha_start is not none",
+                ),
+                error_type=ValueError,
+                error_regex="Both the alpha_warmup_steps and alpha_start need to be initialized for schedule",
+            ),
+        ]
+    return error_inputs
 
 def optim_inputs_func_asgd(device, dtype=None):
     cuda_supported_configs = [
