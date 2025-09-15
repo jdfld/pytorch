@@ -12,6 +12,7 @@ import torch
 from torch import Tensor
 from torch.nn import Parameter
 from torch.optim import (
+    AdEMAMix,
     Adadelta,
     Adafactor,
     Adagrad,
@@ -748,6 +749,65 @@ def optim_inputs_func_adamw(device, dtype=None):
 def optim_error_inputs_func_adamw(device, dtype):
     return optim_error_inputs_func_adam(device, dtype)
 
+
+def optim_inputs_func_ademamix(device, dtype=None):
+    cuda_supported_configs = [
+        OptimizerInput(params=None, kwargs={"capturable": True}, desc="capturable"),
+        OptimizerInput(
+            params=None,
+            kwargs={"weight_decay": 0.1, "capturable": True},
+            desc="capturable with weight decay",
+        ),
+        OptimizerInput(
+            params=None,
+            kwargs={"lr": torch.tensor(0.001), "capturable": True},
+            desc="Tensor lr with capturable",
+        ),
+    ]
+
+    return [
+        OptimizerInput(params=None, kwargs={}, desc="default"),
+        OptimizerInput(params=None, kwargs={"lr": 0.01}, desc="non-default lr"),
+        OptimizerInput(
+            params=None, kwargs={"weight_decay": 0.1}, desc="nonzero weight_decay"
+        ),
+        OptimizerInput(params=None, kwargs={"maximize": True}, desc="maximize"),
+        OptimizerInput(
+            params=None,
+            kwargs={"weight_decay": 0.1, "maximize": True},
+            desc="maximize, weight_decay",
+        ),
+        OptimizerInput(
+            params=None,
+            kwargs={"betas": (0.5,0.75,0.99)},
+            desc="Non default betas",
+        ),
+        OptimizerInput(
+            params=None,
+            kwargs={"betas": (torch.Tensor(0.5),torch.Tensor(0.75),torch.Tensor(0.99))},
+            desc="Non default betas",
+        ),
+        OptimizerInput(
+            params=None,
+            kwargs={"lr": torch.tensor(0.001), "capturable": True},
+            desc="Tensor lr with capturable",
+        ),
+        OptimizerInput(
+            params=None,
+            kwargs={"alpha":4},
+            desc="Alpha with capturable",
+        ),
+        OptimizerInput(
+            params=None,
+            kwargs={"alpha":torch.tensor(4), "capturable": True},
+            desc="Alpha tensor with capturable",
+        ),
+    ] + (cuda_supported_configs if _get_device_type(device) == "cuda" else [])
+
+def optim_error_inputs_func_ademamix(device, dtype):
+    
+
+    return 
 
 def optim_inputs_func_asgd(device, dtype=None):
     cuda_supported_configs = [

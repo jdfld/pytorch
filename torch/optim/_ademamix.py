@@ -14,7 +14,6 @@
 
 # mypy: allow-untyped-defs
 from typing import cast, Optional, Union
-from collections.abs import Callable
 
 import torch
 from torch import Tensor
@@ -73,15 +72,14 @@ class AdEMAMix(Optimizer):
         params: ParamsT,
         lr: Union[float, Tensor] = 1e-3,
         betas: tuple[Union[float, Tensor], Union[float, Tensor],Union[float, Tensor]] = (0.9, 0.999,0.9999), # beta3 chosen from paper
-        alpha_init: Union[float]
         alpha: Union[float,Tensor] = 5, #TODO Verify that this is an okay value. The paper describes that the value should be set between 4-10 however the github implementation uses 2.
         eps: float = 1e-8,
         weight_decay: float = 0,
         amsgrad: bool = False,
-        beta3_warmup_steps: int = None,
-        beta3_start: Union[float,Tensor] = None,
-        alpha_warmup_steps: int = None,
-        alpha_start: Union[float,Tensor] = None, 
+        beta3_warmup_steps: Optional[int] = None,
+        beta3_start: Optional[Union[float,Tensor]] = None,
+        alpha_warmup_steps: Optional[int] = None,
+        alpha_start: Optional[Union[float,Tensor]] = None, 
         *,
         foreach: Optional[bool] = None,
         maximize: bool = False,
@@ -108,11 +106,11 @@ class AdEMAMix(Optimizer):
             raise ValueError(f"Invalid beta parameter at index 2: {betas[2]}")
         if not 0.0 <= weight_decay:
             raise ValueError(f"Invalid weight_decay value: {weight_decay}")
-        if not 0.0 <= beta3_start < 1.0:
+        if not beta3_start is None and not 0.0 <= beta3_start < 1.0:
             raise ValueError(f"Invalid start value of beta3: {beta3_start}")
-        if not 1 < beta3_warmup_steps:
+        if not beta3_warmup_steps is None and not 1 < beta3_warmup_steps:
             raise ValueError(f"Invalid number of warmup steps for beta3: {beta3_warmup_steps}")
-        if not 1 < alpha_warmup_steps:
+        if not alpha_warmup_steps is None and not 1 < alpha_warmup_steps:
             raise ValueError(f"Invalid number of warmup steps for alpha: {alpha_warmup_steps}")
         if not (
             (isinstance(betas[0], float) and isinstance(betas[1], float) and isinstance(betas[2], float))
@@ -290,7 +288,7 @@ class AdEMAMix(Optimizer):
             alpha = group['alpha']
             if self.beta3_scheduler:
                 beta3 = self.beta3_scheduler(state_steps)
-            if self.alpha_scheduler
+            if self.alpha_scheduler:
                 alpha = self.alpha_scheduler(state_steps)
             has_complex = self._init_group(
                 group,
@@ -578,8 +576,11 @@ def _single_tensor_ademamix(
             # Computes numerator for update step
             # As the slow moving average should not be modified by the bias correction, 
             # we cannot fold in the operation with the lr
-            numer = torch.div(exp_avg_fast, bias_correction1)
-            numer.addcmul_(alpha,exp_avg_slow)
+            numer = torch.div(exp_avg_fast.clone(), bias_correction1)
+            if differentiable and isinstance(alpha,torch.Tensor):
+                numer.add_(alpha.clone()*exp_avg_slow.clone())
+            else:
+                numer.add_(alpha*exp_avg_slow.clone())
 
             
             # Computes denominator for update step

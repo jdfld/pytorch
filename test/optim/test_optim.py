@@ -7,8 +7,8 @@ from typing import Any
 import torch
 from torch import nn, Tensor
 from torch.optim import (
-    AdEMAMix,
     Adadelta,
+    AdEMAMix,
     Adagrad,
     Adam,
     Adamax,
@@ -75,19 +75,26 @@ def _multistep_backprop_diff_hyperparams_fn(
         for k, v in opt_differentiable_state.items()
     }
 
-    # This copy is necessary so the update on line 78 doesn't overwrite the original kwargs values
+    # This copy is necessary so the update on line 78 doesn't overwrite the original kwargs
     kwargs = kwargs.copy()
 
     # Have to pass in beta1 and beta2 separately
     # so they're passed in as Tensors (not a tuple) and recognized by gradcheck
     # CHANGE
-    if "beta1" in kwargs or "beta2" in kwargs or "beta3" in kwargs:
-        # Prevent just one beta kwarg from being passed in
-        assert "beta1" in kwargs and "beta2" in kwargs and "beta3" in kwargs, (
-            "Both betas should be defined in kwargs"
-        )
-        kwargs.update({"betas": (kwargs.pop("beta1"), kwargs.pop("beta2"), kwargs.pop("beta3"))})
-
+    if opt_class is AdEMAMix:
+        if "beta1" in kwargs or "beta2" in kwargs or "beta3" in kwargs:
+            # Prevent just one beta kwarg from being passed in
+            assert "beta1" in kwargs and "beta2" in kwargs and "beta3" in kwargs, (
+                "All three betas for AdEMAMix should be defined in kwargs"
+            )
+            kwargs.update({"betas": (kwargs.pop("beta1"), kwargs.pop("beta2"), kwargs.pop("beta3"))})
+    else: 
+        if "beta1" in kwargs or "beta2" in kwargs:
+            # Prevent just one beta kwarg from being passed in
+            assert "beta1" in kwargs and "beta2" in kwargs, (
+                "Both betas should be defined in kwargs"
+            )
+            kwargs.update({"betas": (kwargs.pop("beta1"), kwargs.pop("beta2"))})
     kwargs.update(
         {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in kwargs.items()}
     )
@@ -96,7 +103,6 @@ def _multistep_backprop_diff_hyperparams_fn(
     ] + (list(kwargs["betas"]) if "betas" in kwargs else [])
 
     criterion = nn.MSELoss()
-
     optimizer = opt_class([params], **kwargs)
     optimizer.state[params].update(opt_differentiable_state)
 
@@ -105,13 +111,14 @@ def _multistep_backprop_diff_hyperparams_fn(
     y = torch.tensor([2.0], dtype=torch.float64)
 
     for _ in range(2):
-        loss = criterion(x * torch.sum(params), y)
-        loss.backward(
-            inputs=(params,),
-            create_graph=True,
-        )
-        optimizer.step()
-        optimizer.zero_grad()
+        with torch.autograd.set_detect_anomaly(True):
+            loss = criterion(x * torch.sum(params), y)
+            loss.backward(
+                inputs=(params,),
+                create_graph=True,
+            )
+            optimizer.step()
+            optimizer.zero_grad()
 
     meta_loss = loss
     meta_loss.backward(inputs=(*differentiable_kwargs,), create_graph=True)
@@ -174,15 +181,15 @@ class TestDifferentiableOptimizer(TestCase):
                 *state.values(),
             ),
         )
-    def test_ademamix(self):
+    def test_AdEMAMix(self):
         state = {}
         p = torch.rand(10, requires_grad=True, dtype=torch.float64)
         grad = torch.rand(10, requires_grad=True, dtype=torch.float64)
         # `step` is not a continuous variable (even though we define it as a float)
         # and so it shouldn't require gradients.
         state["step"] = torch.tensor(10.0, requires_grad=False, dtype=torch.float64)
-        state["exp_fast_avg"] = torch.rand(10, requires_grad=True, dtype=torch.float64)
-        state["exp_slow_avg"] = torch.rand(10, requires_grad=True, dtype=torch.float64)
+        state["exp_avg_fast"] = torch.rand(10, requires_grad=True, dtype=torch.float64)
+        state["exp_avg_slow"] = torch.rand(10, requires_grad=True, dtype=torch.float64)
         state["exp_avg_sq"] = torch.rand(10, requires_grad=True, dtype=torch.float64)
         state["max_exp_avg_sq"] = torch.rand(
             10, requires_grad=True, dtype=torch.float64
@@ -195,15 +202,13 @@ class TestDifferentiableOptimizer(TestCase):
                 state,
                 AdEMAMix,
                 {"lr": 0.9,
-                 "beta1": 0.99,
-                 "beta2": 0.999,
-                 "beta3": 0.9999,
                  "alpha": 5, 
                  "weight_decay":0.1,
                  "differentiable": True,
                  "amsgrad": True},
                 *state.values(),
             ),
+        )
         gradcheck(
             _diff_fn,
             (
@@ -212,11 +217,10 @@ class TestDifferentiableOptimizer(TestCase):
                 state,
                 AdEMAMix,
                 {"lr": 0.9,
-                 "uncoupled_weight_decay":False,
+                 "decoupled_weight_decay":False,
                  "differentiable": True},
                 *state.values(),
             ),
-        )
         )
 
 
@@ -805,15 +809,15 @@ class TestDifferentiableOptimizer(TestCase):
         )
     
 
-    def test_ademamix_differentiable_lr(self):
+    def test_AdEMAMix_differentiable_lr(self):
         params = torch.rand(10, requires_grad=True, dtype=torch.float64)
         grad = torch.rand_like(params, requires_grad=True, dtype=torch.float64)
         lr = torch.tensor(0.001, requires_grad=True, dtype=torch.float64)
 
         state = {}
         state["step"] = torch.tensor(10.0, requires_grad=False, dtype=torch.float64)
-        state["exp_fast_avg"] = torch.rand(10, requires_grad=True, dtype=torch.float64)
-        state["exp_slow_avg"] = torch.rand(10, requires_grad=True, dtype=torch.float64)
+        state["exp_avg_fast"] = torch.rand(10, requires_grad=True, dtype=torch.float64)
+        state["exp_avg_slow"] = torch.rand(10, requires_grad=True, dtype=torch.float64)
         state["exp_avg_sq"] = torch.rand(10, requires_grad=True, dtype=torch.float64)
         state["max_exp_avg_sq"] = torch.rand(
             10, requires_grad=True, dtype=torch.float64
@@ -833,14 +837,15 @@ class TestDifferentiableOptimizer(TestCase):
             ),
         )
     
-    def test_ademamix_differentiable_weight_decay(self):
+    def test_AdEMAMix_differentiable_weight_decay(self):
         params = torch.rand(10, requires_grad=True, dtype=torch.float64)
         grad = torch.rand_like(params, requires_grad=True, dtype=torch.float64)
         weight_decay = torch.tensor(0.999, requires_grad=True, dtype=torch.float64)
 
         state = {}
         state["step"] = torch.tensor(10.0, requires_grad=False, dtype=torch.float64)
-        state["exp_avg"] = torch.rand(10, requires_grad=True, dtype=torch.float64)
+        state["exp_avg_fast"] = torch.rand(10, requires_grad=True, dtype=torch.float64)
+        state["exp_avg_slow"] = torch.rand(10, requires_grad=True, dtype=torch.float64)
         state["exp_avg_sq"] = torch.rand(10, requires_grad=True, dtype=torch.float64)
         state["max_exp_avg_sq"] = torch.rand(
             10, requires_grad=True, dtype=torch.float64
@@ -859,7 +864,7 @@ class TestDifferentiableOptimizer(TestCase):
                 *kwargs.values(),
             ),
         )
-    def test_ademamix_differentiable_betas(self):
+    def test_AdEMAMix_differentiable_betas(self):
         params = torch.rand(10, requires_grad=True, dtype=torch.float64)
         grad = torch.rand_like(params, requires_grad=True, dtype=torch.float64)
 
@@ -870,8 +875,8 @@ class TestDifferentiableOptimizer(TestCase):
         )
         state = {}
         state["step"] = torch.tensor(10.0, requires_grad=False, dtype=torch.float64)
-        state["exp_fast_avg"] = torch.rand(10, requires_grad=True, dtype=torch.float64)
-        state["exp_slow_avg"] = torch.rand(10, requires_grad=True, dtype=torch.float64)
+        state["exp_avg_fast"] = torch.rand(10, requires_grad=True, dtype=torch.float64)
+        state["exp_avg_slow"] = torch.rand(10, requires_grad=True, dtype=torch.float64)
         state["exp_avg_sq"] = torch.rand(10, requires_grad=True, dtype=torch.float64)
         state["max_exp_avg_sq"] = torch.rand(
             10, requires_grad=True, dtype=torch.float64
@@ -900,14 +905,14 @@ class TestDifferentiableOptimizer(TestCase):
             ),
         )
 
-    def test_ademamix_diffrentiable_alpha(self):
+    def test_AdEMAMix_diffrentiable_alpha(self):
         params = torch.rand(10, requires_grad=True, dtype=torch.float64)
         grad = torch.rand_like(params, requires_grad=True, dtype=torch.float64)
         alpha = torch.tensor(4,requires_grad=True,dtype=torch.float64)
         state = {}
         state["step"] = torch.tensor(10.0, requires_grad=False, dtype=torch.float64)
-        state["exp_fast_avg"] = torch.rand(10, requires_grad=True, dtype=torch.float64)
-        state["exp_slow_avg"] = torch.rand(10, requires_grad=True, dtype=torch.float64)
+        state["exp_avg_fast"] = torch.rand(10, requires_grad=True, dtype=torch.float64)
+        state["exp_avg_slow"] = torch.rand(10, requires_grad=True, dtype=torch.float64)
         state["exp_avg_sq"] = torch.rand(10, requires_grad=True, dtype=torch.float64)
         state["max_exp_avg_sq"] = torch.rand(
             10, requires_grad=True, dtype=torch.float64
@@ -928,7 +933,7 @@ class TestDifferentiableOptimizer(TestCase):
         )
 
 
-    def test_ademamix_differentiable_all_hyperparams(self):
+    def test_AdEMAMix_differentiable_all_hyperparams(self):
         params = torch.rand(10, requires_grad=True, dtype=torch.float64)
         grad = torch.rand_like(params, requires_grad=True, dtype=torch.float64)
 
@@ -942,8 +947,8 @@ class TestDifferentiableOptimizer(TestCase):
         alpha = torch.tensor(4,requires_grad=True,dtype=torch.float64)
         state = {}
         state["step"] = torch.tensor(10.0, requires_grad=False, dtype=torch.float64)
-        state["exp_fast_avg"] = torch.rand(10, requires_grad=True, dtype=torch.float64)
-        state["exp_slow_avg"] = torch.rand(10, requires_grad=True, dtype=torch.float64)
+        state["exp_avg_fast"] = torch.rand(10, requires_grad=True, dtype=torch.float64)
+        state["exp_avg_slow"] = torch.rand(10, requires_grad=True, dtype=torch.float64)
         state["exp_avg_sq"] = torch.rand(10, requires_grad=True, dtype=torch.float64)
         state["max_exp_avg_sq"] = torch.rand(
             10, requires_grad=True, dtype=torch.float64

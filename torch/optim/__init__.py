@@ -8,6 +8,7 @@ future.
 
 from torch.optim import lr_scheduler as lr_scheduler, swa_utils as swa_utils
 from torch.optim._adafactor import Adafactor as Adafactor
+from torch.optim._ademamix import AdEMAMix as AdEMAMix
 from torch.optim._muon import Muon as Muon
 from torch.optim.adadelta import Adadelta as Adadelta
 from torch.optim.adagrad import Adagrad as Adagrad

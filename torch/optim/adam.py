@@ -473,7 +473,7 @@ def _single_tensor_adam(
                 if beta1.requires_grad:
                     bias_correction1 = 1 - beta1 ** step.clone()
                 else:
-                    bias_correction1 = 1 - beta1**step
+                    bias_correction1 = 1 - beta1 ** step
             else:
                 bias_correction1 = 1 - beta1**step
 
