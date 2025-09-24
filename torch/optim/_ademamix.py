@@ -9,9 +9,6 @@
 # TODO implement fused version, by adapting code from:
 # pytorch/aten/src/ATen/native/cuda/FusedAdamWKernel.cu
 
-# TODO look more at the scheduling side, additionally Initialization of the EMA
-# is also something which could be relevant to look at.
-
 # mypy: allow-untyped-defs
 from typing import cast, Optional, Union
 
@@ -29,7 +26,6 @@ from .optimizer import (
     _get_value,
     _maximize_doc,
     _params_doc,
-    _stack_if_compiling,
     _to_scalar,
     _use_grad_for_differentiable,
     _view_as_real,
@@ -39,29 +35,45 @@ from .optimizer import (
     ParamsT,
 )
 
+
+
 __all__ = ["AdEMAMix", "ademamix"]
 
 
 # Schedulers implemented from the jax based version of AdEMAMix, adapted for torch
-def _alpha_scheduler(alpha_end, alpha_start, warmup=1):
-    def schedule(step):
-        is_warmup = (step < warmup).astype(torch.float32)
-        a = step / float(warmup)
-        return is_warmup * ((1.0-a) * alpha_start + a * alpha) + alpha * (1.0-is_warmup)
+def _alpha_scheduler(alpha_end, alpha_init, warmup=1):
+    def schedule(steps,device):
+        if isinstance(steps, (list)):
+            steps = torch.tensor(steps, dtype=torch.float)
+        else:
+            steps = torch.tensor([steps], dtype=torch.float)
+        is_warmup = (steps < warmup).float()
+        a = steps / float(warmup)
+        alpha = is_warmup * ((1.0-a) * alpha_init + a * alpha_end) + alpha_end * (1.0-is_warmup)
+        return alpha.to(device,non_blocking=True).unbind() if len(alpha) > 1 else alpha.item()
     return schedule
 
-def _beta3_scheduler(beta_end, beta_start, warmup=1): 
+def _beta3_scheduler(beta_end, beta_start, warmup=1):
     def f(beta):
-        return torch.log(0.5)/torch.log(beta)-1
+        return torch.log(torch.Tensor([0.5])) / torch.log(torch.Tensor([beta])) - 1
 
     def f_inv(t):
-        return torch.pow(0.5,1/(t+1))
-    
-    def schedule(step):
-        is_warmup = (step < warmup).astype(torch.float32)
-        a = step / float(warmup)
-        return is_warmup * f_inv((1.0-a) * f(beta_start) + a * f(beta_end)) + beta_end * (1.0-is_warmup)
+        return torch.pow(torch.Tensor([0.5]), 1.0 / (t + 1))
+
+    def schedule(steps,device):
+        if isinstance(steps, (list, tuple)):
+            steps = torch.tensor(steps, dtype=torch.float)
+        else:
+            steps = torch.tensor([steps], dtype=torch.float)
+        is_warmup = (steps < warmup).float()
+        a = steps / float(warmup)
+        betas = is_warmup * f_inv((1.0 - a) * f(beta_start) + a * f(beta_end)) \
+              + (1.0 - is_warmup) * beta_end    
+        return betas.to(device,non_blocking=True).unbind() if len(betas) > 1 else betas.item()
+
     return schedule
+
+
 
 
 
@@ -77,9 +89,9 @@ class AdEMAMix(Optimizer):
         weight_decay: float = 0,
         amsgrad: bool = False,
         beta3_warmup_steps: Optional[int] = None,
-        beta3_start: Optional[Union[float,Tensor]] = None,
+        beta3_init: Optional[Union[float,Tensor]] = None,
         alpha_warmup_steps: Optional[int] = None,
-        alpha_start: Optional[Union[float,Tensor]] = None, 
+        alpha_init: Optional[Union[float,Tensor]] = None, 
         *,
         foreach: Optional[bool] = None,
         maximize: bool = False,
@@ -106,8 +118,8 @@ class AdEMAMix(Optimizer):
             raise ValueError(f"Invalid beta parameter at index 2: {betas[2]}")
         if not 0.0 <= weight_decay:
             raise ValueError(f"Invalid weight_decay value: {weight_decay}")
-        if not beta3_start is None and not 0.0 <= beta3_start < 1.0:
-            raise ValueError(f"Invalid start value of beta3: {beta3_start}")
+        if not beta3_init is None and not 0.0 <= beta3_init < 1.0:
+            raise ValueError(f"Invalid start value of beta3: {beta3_init}")
         if not beta3_warmup_steps is None and not 1 < beta3_warmup_steps:
             raise ValueError(f"Invalid number of warmup steps for beta3: {beta3_warmup_steps}")
         if not alpha_warmup_steps is None and not 1 < alpha_warmup_steps:
@@ -117,10 +129,10 @@ class AdEMAMix(Optimizer):
             or (isinstance(betas[0], Tensor) and isinstance(betas[1], Tensor) and isinstance(betas[2], Tensor))
         ):
             raise ValueError("All three betas need to be floats or Tensors")
-        if ((beta3_warmup_steps is None) != (beta3_start is None)):
+        if ((beta3_warmup_steps is None) != (beta3_init is None)):
             raise ValueError("Both the betas_warmup_steps and beta_start need to be initialized for scheduler")
-        if ((beta3_warmup_steps is None) != (beta3_start is None)):
-            raise ValueError("Both the alpha_warmup_steps and alpha_start need to be initialized for schedule")
+        if ((alpha_warmup_steps is None) != (alpha_init is None)):
+            raise ValueError("Both the alpha_warmup_steps and alpha_init need to be initialized for schedule")
         if isinstance(betas[0], Tensor):
             if not capturable and foreach:
                 raise ValueError(
@@ -156,8 +168,8 @@ class AdEMAMix(Optimizer):
             differentiable=differentiable,
             decoupled_weight_decay=decoupled_weight_decay,
         )
-        self.beta3_scheduler = None if beta3_start is None else _beta3_scheduler(betas[2], beta3_start, beta3_warmup_steps)
-        self.alpha_scheduler = None if alpha_start is None else _alpha_scheduler(alpha, alpha_start, alpha_warmup_steps)
+        self.beta3_scheduler = None if beta3_init is None else _beta3_scheduler(betas[2], beta3_init, beta3_warmup_steps)
+        self.alpha_scheduler = None if alpha_init is None else _alpha_scheduler(alpha, alpha_init, alpha_warmup_steps)
         super().__init__(params, defaults)
 
     def __setstate__(self, state):
@@ -286,10 +298,6 @@ class AdEMAMix(Optimizer):
             state_steps: list[Tensor] = []
             beta1, beta2, beta3 = group["betas"]
             alpha = group['alpha']
-            if self.beta3_scheduler:
-                beta3 = self.beta3_scheduler(state_steps)
-            if self.alpha_scheduler:
-                alpha = self.alpha_scheduler(state_steps)
             has_complex = self._init_group(
                 group,
                 params_with_grad,
@@ -300,7 +308,6 @@ class AdEMAMix(Optimizer):
                 max_exp_avg_sqs,
                 state_steps,
             )
-
             ademamix(
                 params_with_grad,
                 grads,
@@ -314,7 +321,9 @@ class AdEMAMix(Optimizer):
                 beta1=beta1,
                 beta2=beta2,
                 beta3=beta3,
-                alpha=alpha,
+                alpha=alpha,            
+                alpha_scheduler=self.alpha_scheduler, 
+                beta3_scheduler=self.beta3_scheduler, 
                 lr=group["lr"],
                 weight_decay=group["weight_decay"],
                 eps=group["eps"],
@@ -385,10 +394,10 @@ AdEMAMix.__doc__ = (
         decoupled_weight_decay (bool, optional): if True, the optimizer functions as described in the original paper
         by handling the weight decay as done in AdamW and the algorithm will not accumulate weight
             decay in the momentum nor variance. (default: True)
-        beta3_start (float, Tensor, optional): If set to a value it represents the initial value,
+        beta3_init (float, Tensor, optional): If set to a value it represents the initial value,
         for the linear scheduling of the beta3 parameter, it will linearly increase to approach beta3.  (default: None)
         beta3_warmup_steps (int,optional): number of steps before moving to the final beta3 value. (default: None)
-        alpha_start (float, Tensor, optional): If set to a value it represents the initial value,
+        alpha_init (float, Tensor, optional): If set to a value it represents the initial value,
         for the linear scheduling of the alpha parameter, it will linearly increase to approach alpha.  (default: None)
         alpha_warmup_steps (int,optional): number of steps before moving to the final alpha value. (default: None)
         amsgrad (bool, optional): whether to use the AMSGrad variant of this
@@ -419,6 +428,8 @@ def _single_tensor_ademamix(
     beta2: Union[float, Tensor],
     beta3: Union[float, Tensor],
     alpha: Union[float, Tensor],
+    alpha_scheduler: Optional[callable], 
+    beta3_scheduler: Optional[callable], 
     lr: Union[float, Tensor],
     weight_decay: float,
     eps: float,
@@ -516,17 +527,25 @@ def _single_tensor_ademamix(
 
         if beta3_dict is not None:
             dtype = param.dtype  # type: ignore[union-attr]
-
             # cast to workaround https://github.com/pytorch/pytorch/issues/140601
             key = (device, dtype)
+
             if key not in beta3_dict:
                 beta3_dict[key] = beta3.to(  # type: ignore[union-attr]
                     device=device, dtype=dtype, non_blocking=True
                 )
-
+            elif beta3_scheduler:    
+                beta3_dict[key] = beta3_scheduler(step_t,device)
             device_beta3: Union[float, Tensor] = beta3_dict[key]
         else:
-            device_beta3 = beta3
+            if beta3_scheduler:
+                device_beta3 = beta3_scheduler(step_t,device)
+            else:
+                device_beta3 = beta3
+        
+    
+        if alpha_scheduler:
+            alpha = alpha_scheduler(step_t,device)
 
         # Decay the first and second moment running average coefficients
         exp_avg_fast.lerp_(grad, 1 - device_beta1)
@@ -605,7 +624,7 @@ def _single_tensor_ademamix(
                 ).add_(eps)
 
             # lr 
-            param.addcdiv_(-lr*numer, denom)
+            param.addcdiv_(numer, denom,value=-lr)
         else:
             step = _get_value(step_t)
 
@@ -625,7 +644,6 @@ def _single_tensor_ademamix(
                 denom = (max_exp_avg_sqs[i].sqrt() / bias_correction2_sqrt).add_(eps)
             else:
                 denom = (exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)
-
             numer = torch.add(exp_avg_fast,exp_avg_slow,alpha=alpha*bias_correction1)
             param.addcdiv_(numer, denom, value=-step_size)
 
@@ -651,6 +669,8 @@ def _multi_tensor_ademamix(
     beta2: Union[float, Tensor],
     beta3: Union[float, Tensor],
     alpha: float,
+    alpha_scheduler: Optional[callable], 
+    beta3_scheduler: Optional[callable], 
     lr: Union[float, Tensor],
     weight_decay: float,
     eps: float,
@@ -713,8 +733,6 @@ def _multi_tensor_ademamix(
 
     lr = _to_scalar(lr)
     # TODO: Support nonzero-dim Tensor betas, see #147921
-    alpha = _to_scalar(alpha)
-    # TODO: Support Tensor alphas
 
     grouped_tensors = Optimizer._group_tensors_by_device_and_dtype(
         [params, grads, exp_avgs_fast, exp_avgs_slow, exp_avg_sqs, max_exp_avg_sqs, state_steps]  # type: ignore[list-item]
@@ -750,13 +768,22 @@ def _multi_tensor_ademamix(
         device_state_steps = cast(list[Tensor], device_state_steps_)
 
         device = device_params[0].device
+            
         if beta1_dict is not None and device not in beta1_dict:
             beta1_dict[device] = beta1.to(device=device, non_blocking=True)  # type: ignore[union-attr, attr-defined]
-        if beta3_dict is not None and device not in beta3_dict:
+        
+        if beta3_dict is not None and beta3_scheduler: # then beta3 will be a tensor.
+            beta3_dict[device] = beta3_scheduler(state_steps,device)
+        elif beta3_dict is not None and device not in beta3_dict:
             beta3_dict[device] = beta3.to(device=device, non_blocking=True)  # type: ignore[union-attr, attr-defined]
 
         device_beta1 = beta1_dict[device] if beta1_dict else beta1
         device_beta3 = beta3_dict[device] if beta3_dict else beta3
+
+        
+        if alpha_scheduler:
+            alpha = alpha_scheduler(state_steps,device)
+
 
         # Handle complex parameters
         if has_complex:
@@ -872,15 +899,18 @@ def _multi_tensor_ademamix(
             #torch._foreach_div_(exp_avg_sq_sqrt, step_size)
 
             # param + (M_2 * alpha + bias_correction1 * M_1) * lr / V_1
-            numer = torch._foreach_addcmul(
-                device_exp_avgs_slow,
+            numer = torch._foreach_mul(
                 device_exp_avgs_fast,
                 bias_correction1,
-                value=-1/alpha # inverted here to skip a neg operation
                 )
+            if alpha is not float:
+                torch._foreach_addcmul_(numer, alpha, device_exp_avgs_slow)
+            else:
+                torch._foreach_add_(numer, device_exp_avgs_slow, alpha)
+            
             # at this point, exp_avg_sq_sqrt =  [sqrt(exp_avg_sq / (1 - beta2^t)) + eps]
-            # and: numer = exp_avgs_slow + exp_avgs_fast / (alpha*(1-beta1^t))
-            torch._foreach_addcdiv_(device_params, numer, exp_avg_sq_sqrt,value=-lr*alpha)
+            # and: numer = alpha*exp_avgs_slow + exp_avgs_fast / (1-beta1^t)
+            torch._foreach_addcdiv_(device_params, numer, exp_avg_sq_sqrt, val=-lr)
         else:
             bias_correction1 = [
                 1 - beta1 ** _get_value(step) for step in device_state_steps
@@ -911,7 +941,11 @@ def _multi_tensor_ademamix(
             # We can fold a operation like bias_correction into addcdiv. 
             # However as we do not want to modify device_exp_avgs_slow with bias_correction this is not possible. 
             numer = torch._foreach_div(device_exp_avgs_fast, bias_correction1)
-            torch._foreach_add_(numer,device_exp_avgs_slow,alpha=alpha)
+            if alpha is not float:
+                torch._foreach_addcmul_(numer,alpha,device_exp_avgs_slow)
+            else:
+                torch._foreach_add_(numer, device_exp_avgs_slow, alpha)
+
             torch._foreach_addcdiv_(
                 device_params,
                 numer,
@@ -943,6 +977,8 @@ def ademamix(
     beta1: float,
     beta2: float,
     beta3: float,
+    alpha_scheduler: Optional[callable] = None, 
+    beta3_scheduler: Optional[callable] = None, 
     lr: Union[float, Tensor],
     weight_decay: float,
     alpha: float,
@@ -960,8 +996,6 @@ def ademamix(
         # Do not flip on foreach for the unsupported case where lr is a Tensor and capturable=False.
         if foreach and isinstance(lr, Tensor) and not capturable:
             foreach = False
-    if foreach is None:
-        foreach = False
 
     # this check is slow during compilation, so we skip it
     # if it's strictly needed we can add this check back in dynamo
@@ -974,8 +1008,6 @@ def ademamix(
 
     if foreach and torch.jit.is_scripting():
         raise RuntimeError("torch.jit.script not supported with foreach optimizers")
-    
-
     elif foreach and not torch.jit.is_scripting():
         func = _multi_tensor_ademamix
     else:
@@ -995,6 +1027,8 @@ def ademamix(
         beta2=beta2,
         beta3=beta3,
         alpha=alpha,
+        alpha_scheduler=alpha_scheduler,
+        beta3_scheduler=beta3_scheduler,
         lr=lr,
         weight_decay=weight_decay,
         eps=eps,
